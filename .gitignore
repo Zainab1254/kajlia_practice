@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+kajlia_demo.db
+__pycache__/
+*.pyc
