@@ -55,6 +55,12 @@ def get_schema():
     lines.append("Note: payments.date is stored as TEXT in YYYY-MM-DD format.")
     lines.append("Note: cheque_status has values: n/a, pending, realized_bank, realized_cash, returned. A payment counts as cleared if cheque_status is NOT 'pending' and NOT 'returned'.")
     lines.append("Note: ignore the is_returned column, it is unused and always 0.")
+    lines.append("Business rules:")
+    lines.append("- total_recovery = SUM(payments.amount) where cheque_status is NOT 'pending' and NOT 'returned'")
+    lines.append("- outstanding = SUM(flats.sale) - total_recovery")
+    lines.append("- pending = SUM(payments.amount) where cheque_status = 'pending'")
+    lines.append("- unsecured = outstanding - pending")
+    lines.append("IMPORTANT: never JOIN flats and payments to sum both tables. A flat has many payments, so joining multiplies flats.sale. Use separate subqueries instead, e.g. (SELECT SUM(sale) FROM flats) - (SELECT SUM(amount) FROM payments WHERE ...)")
 
     return "\n".join(lines)
 question = st.text_input("Apna sawal likhein")
@@ -94,19 +100,24 @@ Question: {question}"""
             st.write(result)
 
         result_cr = result.copy()
+        money_words = ["amount", "sale", "value", "recovery", "outstanding", "unsecured"]
         for c in result_cr.columns:
-            if result_cr[c].dtype.kind in "if":
+            if result_cr[c].dtype.kind in "if" and any(w in c.lower() for w in money_words):
                 result_cr[c] = (result_cr[c] / 10_000_000).round(2)
 
         answer_prompt = f"""Answer the question in one or two sentences based only on this result.
 
 Question: {question}
-SQL result (all amounts already in crore): {result_cr.to_string()}
+SQL result: {result_cr.to_string()}
 
 Rules:
+- Columns whose name contains amount, sale, value, recovery, outstanding, or unsecured are in crore.
+- All other numbers are plain counts, not crore.
+- Do NOT calculate anything yourself.
 - Numbers are already in crore. Use them exactly as given.
 - Do NOT calculate anything yourself.
 - No recommendations, no advice.
-- If the result is empty, say no data was found."""
+- If the result is empty, say no data was found.
+- Amount columns are already in crore. Count columns are plain numbers, not crore."""
 
         st.write(llm_call(answer_prompt))
