@@ -24,6 +24,21 @@ def _num(v):
         s = s[:-3]
     return s
 
+def pick_unit(values):
+    """UNIT KA FAISLA SIRF YAHAN HOTA HAI. Aur kahin nahi.
+
+    Sab se bari raqam dekh kar (taqseem, unit ka naam) wapas karta hai:
+      1 crore ya us se zyada -> crore
+      1 lakh se 1 crore      -> lakh
+      1 lakh se kam          -> rupees
+    """
+    biggest = max((abs(v) for v in values if pd.notna(v)), default=0)
+    if biggest >= 10_000_000:
+        return 10_000_000, "crore"
+    if biggest >= 100_000:
+        return 100_000, "lakh"
+    return 1, "rupees"
+
 def to_readable(df):
     """UNIT KA FAISLA SIRF YAHAN HOTA HAI. Aur kahin nahi.
 
@@ -38,17 +53,9 @@ def to_readable(df):
     for c in list(out.columns):
         if not c.lower().endswith("_rupees") or out[c].dtype.kind not in "if":
             continue
-        biggest = out[c].abs().max()
-        if pd.isna(biggest):
-            continue
-        if biggest >= 10_000_000:
-            div, suffix = 10_000_000, "_crore"
-        elif biggest >= 100_000:
-            div, suffix = 100_000, "_lakh"
-        else:
-            div, suffix = 1, "_rupees"
+        div, unit = pick_unit(out[c])
         out[c] = out[c].map(lambda v: _num(v / div))
-        renames[c] = c[:-len("_rupees")] + suffix
+        renames[c] = c[:-len("_rupees")] + "_" + unit
     return out.rename(columns=renames)
 
 def check_sql(sql):
@@ -85,6 +92,43 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Recovered", f"{total_recovery_cr:.2f} cr")
 col2.metric("Outstanding", f"{outstanding_cr:.1f} cr")
 col3.metric("Unsecured", f"{unsecured_cr:.1f} cr")
+
+# ---------------------------------------------------------------- Charts
+def mahana_wasooli():
+    """Har mahine ki wasooli aur chalta hua total. Hisaab yahan Python karta hai."""
+    cl = payments[~payments["cheque_status"].isin(["pending", "returned"])].copy()
+    cl["_m"] = pd.to_datetime(cl["date"]).dt.to_period("M")
+    g = cl.groupby("_m")["amount"].sum().sort_index()
+    return pd.DataFrame({
+        "Mahina": [m.strftime("%b %Y") for m in g.index],
+        "_order": range(len(g)),
+        "wasooli": g.values,
+        "total": g.cumsum().values,
+    })
+
+
+_mw = mahana_wasooli()
+
+_d1, _u1 = pick_unit(_mw["wasooli"])
+st.markdown("**Har mahine kitni wasooli hui**")
+st.bar_chart(
+    pd.DataFrame({f"Wasooli ({_u1})": (_mw["wasooli"] / _d1).values},
+                 index=pd.CategoricalIndex(_mw["Mahina"], categories=_mw["Mahina"],
+                                           ordered=True, name="Mahina")),
+    y=f"Wasooli ({_u1})",
+)
+
+_d2, _u2 = pick_unit(_mw["total"])
+st.markdown("**Chalta hua total — ab tak kul kitna wasool hua**")
+st.line_chart(
+    pd.DataFrame({f"Chalta hua total ({_u2})": (_mw["total"] / _d2).values},
+                 index=pd.CategoricalIndex(_mw["Mahina"], categories=_mw["Mahina"],
+                                           ordered=True, name="Mahina")),
+    y=f"Chalta hua total ({_u2})",
+)
+
+st.caption("Dono chart sirf wo payments ginte hain jo clear ho chuki hain "
+           "(pending aur returned shamil nahi).")
 
 # ---------------------------------------------------------------- Khamosh flats
 def pretty_columns(df):
