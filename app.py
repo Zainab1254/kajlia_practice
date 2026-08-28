@@ -7,6 +7,49 @@ import re
 FORBIDDEN_SQL_WORDS = ["insert", "update", "delete", "drop", "alter", "create", "replace"]
 FORBIDDEN_SQL_RE = re.compile(r"\b(" + "|".join(FORBIDDEN_SQL_WORDS) + r")\b")
 
+MONEY_COL_RE = re.compile(r"\b(amount|sale|principal|dr|cr|rate|received|refund|forfeit|discount)\b")
+
+def needs_rupees_alias(sql):
+    """SQL paison ka column le rahi hai magar kisi output column ka naam _rupees par khatam nahi hota."""
+    s = sql.lower()
+    return MONEY_COL_RE.search(s) is not None and "_rupees" not in s
+
+def _num(v):
+    """Number ko parhne layak banata hai: comma lagata hai, bekaar sifar hatata hai."""
+    if pd.isna(v):
+        return ""
+    s = f"{v:,.2f}"
+    if s.endswith(".00"):
+        s = s[:-3]
+    return s
+
+def to_readable(df):
+    """UNIT KA FAISLA SIRF YAHAN HOTA HAI. Aur kahin nahi.
+
+    Har _rupees column ko ek hi unit mein badalta hai (poore column ki sab se bari
+    raqam dekh kar, har row ki alag nahi), aur naam ke aakhir mein unit likh deta hai:
+      1 crore ya us se zyada -> _crore
+      1 lakh se 1 crore      -> _lakh
+      1 lakh se kam          -> _rupees (waise hi, comma ke saath)
+    """
+    out = df.copy()
+    renames = {}
+    for c in list(out.columns):
+        if not c.lower().endswith("_rupees") or out[c].dtype.kind not in "if":
+            continue
+        biggest = out[c].abs().max()
+        if pd.isna(biggest):
+            continue
+        if biggest >= 10_000_000:
+            div, suffix = 10_000_000, "_crore"
+        elif biggest >= 100_000:
+            div, suffix = 100_000, "_lakh"
+        else:
+            div, suffix = 1, "_rupees"
+        out[c] = out[c].map(lambda v: _num(v / div))
+        renames[c] = c[:-len("_rupees")] + suffix
+    return out.rename(columns=renames)
+
 def check_sql(sql):
     """Query mehfooz hai ya nahi. Poora lafz dekhta hai, kisi lafz ke andar chhupa tukra nahi."""
     s = sql.strip().lower()
@@ -41,22 +84,6 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Recovered", f"{total_recovery_cr:.2f} cr")
 col2.metric("Outstanding", f"{outstanding_cr:.1f} cr")
 col3.metric("Unsecured", f"{unsecured_cr:.1f} cr")
-def llm_call(prompt):
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        },
-        json={
-            "model": "claude-sonnet-4-5",
-            "max_tokens": 800,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": prompt}]
-        }
-    )
-    return r.json()["content"][0]["text"]
 
 def get_schema():
     lines = []
@@ -126,7 +153,18 @@ if agent_q:
 
 Use the run_sql tool to get real numbers. Never guess a number.
 You may call the tool several times if the question needs multiple steps.
-Amounts in the database are in rupees. Convert to crore only in your final answer by stating the rupee figure divided by 10,000,000 — but do not do arithmetic beyond that conversion.
+
+Column naming — this is required:
+- Every column that holds a rupee amount MUST be aliased with a name ending in _rupees.
+  Example: SELECT SUM(amount) AS total_recovery_rupees FROM payments
+- Never use the _rupees suffix for counts, dates, names, or IDs.
+
+Units — the numbers are converted for you before you see them:
+- The unit is written at the end of each column name (_crore, _lakh, _rupees) and that
+  IS the unit of that number.
+- Use every number exactly as given. Never divide, multiply, or calculate anything yourself.
+- State the unit that the column name says (crore, lakh, or rupees).
+
 No recommendations, no advice. State only what the data shows.
 Before comparing time periods, first check the actual date range of the data (MIN and MAX of payments.date). Never compare a period that falls outside the available data — say so instead.
 Reply in the same script the question was written in. If the question is in Roman Urdu (Urdu written in English letters), reply in Roman Urdu — never in Devanagari or Arabic script.
@@ -160,10 +198,14 @@ Question: {agent_q}"""}]
                     out = "ERROR: only SELECT queries are allowed."
                 elif not ok:
                     out = "ERROR: this query is not allowed. Use a plain SELECT."
+                elif needs_rupees_alias(q):
+                    out = ("ERROR: this query returns a rupee amount but no output column "
+                           "name ends in _rupees. Rewrite it, changing only the column "
+                           "aliases so every rupee column ends in _rupees.")
                 else:
                     try:
-                        df = pd.read_sql(q, conn)
-                        out = df.to_string()
+                        df = to_readable(pd.read_sql(q, conn))
+                        out = df.to_string(index=False)
                         with st.expander(f"Step {step+1}: result"):
                             st.write(df)
                     except Exception as e:
@@ -176,64 +218,3 @@ Question: {agent_q}"""}]
                 })
 
         messages.append({"role": "user", "content": tool_results})
-         
-
-question = st.text_input("Apna sawal likhein")
-
-if question:
-    sql_prompt = f"""You are a SQLite expert. Write ONE SQL query to answer the question.
-
-{get_schema()}
-
-Rules:
-- Return ONLY the SQL query. No explanation, no markdown, no backticks.
-- Use SELECT only. Never use INSERT, UPDATE, DELETE, DROP, or ALTER.
-- Amounts are in rupees, not crore.
-
-Question: {question}"""
-
-    sql = llm_call(sql_prompt).strip()
-    with st.expander("SQL dekhein"):
-        st.code(sql, language="sql")
-    ok, reason = check_sql(sql)
-
-    if not ok and reason == "not_select":
-        st.error("Sirf SELECT queries chal sakti hain.")
-    elif not ok:
-        st.error("Ye query mehfooz nahi hai.")
-    else:
-        try:
-            result = pd.read_sql(sql, conn)
-        except Exception as e:
-            st.error("Ye query chal nahi saki. Sawal thora alag tareeqe se likh kar dekhein.")
-            with st.expander("Technical details"):
-                st.write(str(e))
-            st.stop()
-
-        with st.expander("Raw result"):
-            st.write(result)
-
-        result_cr = result.copy()
-        money_words = ["amount", "sale", "value", "recovery", "outstanding", "unsecured"]
-        for c in result_cr.columns:
-            if result_cr[c].dtype.kind in "if" and any(w in c.lower() for w in money_words):
-                result_cr[c] = (result_cr[c] / 10_000_000).round(2)
-
-        answer_prompt = f"""Answer the question in one or two sentences based only on this result.
-
-Question: {question}
-SQL result: {result_cr.to_string()}
-
-Rules:
-- Columns whose name contains amount, sale, value, recovery, outstanding, or unsecured are in crore.
-- All other numbers are plain counts, not crore.
-- Do NOT calculate anything yourself.
-- Numbers are already in crore. Use them exactly as given.
-- No recommendations, no advice.
-- If the result is empty, say no data was found."""
-
-        st.write(llm_call(answer_prompt))
-
-
-
-
