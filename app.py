@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 import requests
 import re
+import datetime
 
 FORBIDDEN_SQL_WORDS = ["insert", "update", "delete", "drop", "alter", "create", "replace"]
 FORBIDDEN_SQL_RE = re.compile(r"\b(" + "|".join(FORBIDDEN_SQL_WORDS) + r")\b")
@@ -84,6 +85,87 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Recovered", f"{total_recovery_cr:.2f} cr")
 col2.metric("Outstanding", f"{outstanding_cr:.1f} cr")
 col3.metric("Unsecured", f"{unsecured_cr:.1f} cr")
+
+# ---------------------------------------------------------------- Khamosh flats
+def pretty_columns(df):
+    """Sirf label khoobsurat banata hai. Unit ka faisla to_readable() karta hai, yahan nahi."""
+    LABEL = {
+        "flat_num": "Flat number", "customer": "Customer", "last_payment": "Aakhri payment",
+        "days_silent": "Kitne din khamosh", "payment_count": "Kitni payments",
+        "baqi": "Baqi", "pending": "Pending cheques",
+    }
+    out = {}
+    for c in df.columns:
+        base, unit = c, None
+        for suffix in ("_crore", "_lakh", "_rupees"):
+            if c.endswith(suffix):
+                base, unit = c[:-len(suffix)], suffix[1:]
+                break
+        name = LABEL.get(base, base)
+        out[c] = f"{name} ({unit})" if unit else name
+    return df.rename(columns=out)
+
+
+def khamosh_flats():
+    """Kaunsa flat chal raha hai aur kaunsa ruk gaya. Sab hisaab yahan Python karta hai."""
+    today = pd.Timestamp(datetime.date.today())
+    cleared_p = payments[~payments["cheque_status"].isin(["pending", "returned"])]
+
+    rec = cleared_p.groupby("flat_id")["amount"].sum()
+    last = cleared_p.groupby("flat_id")["date"].max()
+    cnt = cleared_p.groupby("flat_id")["id"].count()
+    pend = payments[payments["cheque_status"] == "pending"].groupby("flat_id")["amount"].sum()
+
+    s = flats[["id", "num", "customer", "sale"]].copy()
+    s["rec"] = s["id"].map(rec).fillna(0.0)
+    s["baqi_rupees"] = s["sale"] - s["rec"]
+    s["last"] = s["id"].map(last)
+    s["payment_count"] = s["id"].map(cnt).fillna(0).astype(int)
+    s["pending_rupees"] = s["id"].map(pend).fillna(0.0)
+    s["days_silent"] = (today - pd.to_datetime(s["last"])).dt.days
+    return s
+
+
+def khamosh_table(rows, never=False):
+    d = pd.DataFrame({
+        "flat_num": rows["num"],
+        "customer": rows["customer"],
+        "baqi_rupees": rows["baqi_rupees"],
+        "last_payment": "Kabhi nahi" if never else rows["last"],
+        "days_silent": "—" if never else rows["days_silent"].astype(int).astype(str),
+        "payment_count": rows["payment_count"],
+        "pending_rupees": rows["pending_rupees"],
+    })
+    return pretty_columns(to_readable(d))
+
+
+with st.expander("Khamosh flats — wasooli ruki hui", expanded=False):
+    _s = khamosh_flats()
+    _zero = _s[_s["rec"] == 0].sort_values("baqi_rupees", ascending=False)
+    _alive = _s[_s["rec"] > 0].sort_values("days_silent", ascending=False)
+    _silent = _alive[_alive["days_silent"] > 60]
+    _stuck = _silent["baqi_rupees"].sum() + _zero["baqi_rupees"].sum()
+
+    st.warning(
+        f"**{len(_silent) + len(_zero)} flats** 2 mahine (60 din) se zyada khamosh hain — "
+        f"in mein **{_stuck / 10_000_000:,.2f} crore** phansi hui hai. "
+        f"(Hisaab {datetime.date.today():%d %B %Y} tak)"
+    )
+
+    st.markdown(f"**Ek rupya bhi wasool nahi hua — {len(_zero)} flats**")
+    st.dataframe(khamosh_table(_zero, never=True), hide_index=True)
+
+    st.markdown(
+        f"**Wasooli shuru hui phir ruk gayi — {len(_alive)} flats** "
+        "(sab se zyada arse se khamosh sab se upar)"
+    )
+    st.dataframe(khamosh_table(_alive), hide_index=True)
+
+    st.caption(
+        "'Aakhri payment' se murad wo aakhri payment hai jo CLEAR ho chuki ho — pending "
+        "cheque ko wasooli nahi mana jata. Isi liye upar wale flats ki koi aakhri payment "
+        "nahi hai, halanke un par cheques pending ho sakte hain."
+    )
 
 def get_schema():
     lines = []
